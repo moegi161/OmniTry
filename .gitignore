@@ -1,3 +1,6 @@
 __pycache__/
 checkpoints/
 .gradio/
+run_video_frames_*.sh
+log.txt
+results/
