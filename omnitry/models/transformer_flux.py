@@ -438,6 +438,53 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
     def _set_gradient_checkpointing(self, module, value=False):
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
+            
+    # Ianna: NEW
+    def _temporal_sa_even_only(self, block, hidden_states, txt_len: int):
+        """
+        Apply temporal self-attention ONLY on even batch indices, ONLY on image tokens.
+        hidden_states: [B=2T, N_img, D]  (this is the image stream, NOT including text)
+        txt_len is not used here because hidden_states is already image-only.
+        """
+        B, N, D = hidden_states.shape
+        if B % 2 != 0:
+            return hidden_states  # safety
+        T = B // 2
+
+        even = hidden_states[0::2]  # [T, N, D]
+
+        # Flatten time into sequence: [1, T*N, D]
+        x = even.reshape(1, T * N, D)
+
+        # Reuse the SAME self-attn weights from this block (qkv + out projection)
+        attn = block.attn  # Attention module inside FluxTransformerBlock
+
+        q = attn.to_q(x)
+        k = attn.to_k(x)
+        v = attn.to_v(x)
+
+        head_dim = q.shape[-1] // attn.heads
+        # [1, heads, L, head_dim]
+        q = q.view(1, -1, attn.heads, head_dim).transpose(1, 2)
+        k = k.view(1, -1, attn.heads, head_dim).transpose(1, 2)
+        v = v.view(1, -1, attn.heads, head_dim).transpose(1, 2)
+
+        # plain SDPA (no RoPE, no varlen) for temporal mixing
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
+        )
+        # back to [1, L, D]
+        y = y.transpose(1, 2).reshape(1, T * N, attn.heads * head_dim)
+        y = attn.to_out[0](y)  # out projection
+        y = attn.to_out[1](y)  # dropout (usually no-op in eval)
+
+        # residual update on even indices only
+        y = y.reshape(T, N, D)
+        hidden_states = hidden_states.clone()
+        hidden_states[0::2] = hidden_states[0::2] + y
+
+        return hidden_states
+
 
     def forward(
         self,
@@ -452,6 +499,9 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         img_shapes: list = None,
         img_lens: list = None,
         return_dict: bool = True,
+        temporal_mode: bool = False,  # Ianna: NEW
+        frames_per_video: int = 1,  # Ianna: NEW
+        temporal_layer_idx: int = 12,  # Ianna: NEW
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -536,7 +586,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
             lens = None
 
         # transformer blocks
-        for block in self.transformer_blocks:
+        for layer_idx, block in enumerate(self.transformer_blocks):  # Ianna: NEW
 
             if self.training and self.gradient_checkpointing:
 
@@ -560,7 +610,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                     joint_attention_kwargs,
                     **ckpt_kwargs,
                 )
-
+                
             else:
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
@@ -570,6 +620,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                     lens=lens, 
                     joint_attention_kwargs=joint_attention_kwargs,
                 )
+                
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
 

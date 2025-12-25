@@ -51,6 +51,9 @@ with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k) for k in f.keys()}
     transformer.load_state_dict(lora_weights, strict=False)
 
+
+
+
 # hack lora forward
 def create_hacked_forward(module):
 
@@ -66,6 +69,8 @@ def create_hacked_forward(module):
             result = result + lora_B(lora_A(dropout(x))) * scaling
         return result
     
+    # Ianna; original version for two-sample batches
+    """
     def hacked_lora_forward(self, x, *args, **kwargs):
         return torch.cat((
             lora_forward(self, 'vtryon_lora', x[:1], *args, **kwargs),
@@ -73,6 +78,57 @@ def create_hacked_forward(module):
         ), dim=0)
     
     return hacked_lora_forward.__get__(module, type(module))
+    """
+
+
+    # Ianna; alternative version supporting mixed batches
+    def hacked_lora_forward(self, x, *args, **kwargs):
+        
+        #Expected batch layout during inference:
+        #  x[0]   = frame_0 (target)
+        #  x[1]   = reference
+        #  x[2]   = frame_1
+        #  x[3]   = reference
+        #  ...
+        #So even indices -> vtryon_lora, odd indices -> garment_lora.
+        
+
+        b = x.shape[0]
+        if b == 0:
+            return x
+
+        # If we only have 1 sample, treat it as target (backward-compatible-ish)
+        if b == 1:
+            return lora_forward(self, "vtryon_lora", x, *args, **kwargs)
+
+        # If we have an even number of samples, assume (target, ref, target, ref, ...)
+        if b % 2 == 0:
+            x_target = x[0::2]  # even indices
+            x_ref = x[1::2]     # odd indices
+
+            y_target = lora_forward(self, "vtryon_lora", x_target, *args, **kwargs)
+            y_ref = lora_forward(self, "garment_lora", x_ref, *args, **kwargs)
+
+            out = torch.empty(
+                (b,) + y_target.shape[1:],
+                device=y_target.device,
+                dtype=y_target.dtype,
+            )
+            out[0::2] = y_target
+            out[1::2] = y_ref
+            return out
+
+        # Fallback for odd batch sizes: keep the original semantics
+        return torch.cat(
+            (
+                lora_forward(self, "vtryon_lora", x[:1], *args, **kwargs),
+                lora_forward(self, "garment_lora", x[1:], *args, **kwargs),
+            ),
+            dim=0,
+        )
+
+    return hacked_lora_forward.__get__(module, type(module))
+    
 
 for n, m in transformer.named_modules():
     if isinstance(m, peft.tuners.lora.layer.Linear):

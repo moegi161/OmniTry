@@ -453,6 +453,7 @@ class FluxFillPipeline(FluxPipeline):
                     continue
 
                 # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
+                T = latents.shape[0]  #Ianna: assuming one video’s frames as batch
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
                 noise_pred = self.transformer(
                     hidden_states=torch.cat((latents, masked_image_latents), dim=-1),
@@ -464,6 +465,8 @@ class FluxFillPipeline(FluxPipeline):
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
+                    temporal_mode=True, #Ianna: <--- NEW
+                    frames_per_video=T, #Ianna: <--- NEW
                 )[0]
 
                 # compute the previous noisy sample x_t -> x_t-1

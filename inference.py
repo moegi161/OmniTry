@@ -40,6 +40,11 @@ import cv2
 from PIL import Image, ImageOps, ImageFilter
 from tqdm import tqdm
 
+import torch
+import math
+import torchvision.transforms as T
+
+
 # Optional natural sort
 try:
     from natsort import natsorted as _natsorted
@@ -162,7 +167,8 @@ def run():
         raise RuntimeError(f"No input frames found at {args.person}")
 
     if args.max_frames is not None:
-        frames_in = frames_in[: args.max_frames]
+        frames_in = frames_in[4: args.max_frames]
+        print(frames_in)
 
     is_dir_input = args.person.is_dir()
 
@@ -183,39 +189,161 @@ def run():
     pbar = tqdm(frames_in, desc="Processing", unit="frame")
     first_frame_size = None
 
-    for in_path in pbar:
-        # Load person frame
-        person_img = ensure_rgb(Image.open(in_path))
+        # ---- Batched inference over all frames ----
+    import gradio_demo as demo_mod  # already imported at top, but safe if you keep it there
 
-        # Optional global resize
-        if args.size is not None:
-            person_img = person_img.resize((args.size, args.size), Image.BICUBIC)
-            ref_proc = ref_proc_base.resize((args.size, args.size), Image.BICUBIC)
-        else:
-            # match reference to current frame size
-            ref_proc = ref_proc_base.resize(person_img.size, Image.BICUBIC)
+    if len(frames_in) == 0:
+        raise ValueError(f"No input frames found under {args.person}")
 
-        # Generate
-        out_img = demo_mod.generate(person_img, ref_proc, args.obj_class, args.steps, args.guidance, args.seed)
+    # Load all person frames
+    person_imgs: List[Image.Image] = [ensure_rgb(Image.open(p)) for p in frames_in]
 
-        # Normalize output to PIL.Image
+    # Optional global resize (to keep everything square and small enough)
+    if args.size is not None:
+        person_imgs = [
+            img.resize((args.size, args.size), Image.BICUBIC) for img in person_imgs
+        ]
+        ref_img_resized = ref_proc_base.resize((args.size, args.size), Image.BICUBIC)
+    else:
+        # Use size of first frame as common size
+        base_size = person_imgs[0].size  # (W, H)
+        person_imgs = [
+            img.resize(base_size, Image.BICUBIC) for img in person_imgs
+        ]
+        ref_img_resized = ref_proc_base.resize(base_size, Image.BICUBIC)
+
+    # Seed like gradio_demo.generate
+    from gradio_demo import seed_everything
+    if args.seed == -1:
+        import random
+        seed = random.randint(0, 2**32 - 1)
+    else:
+        seed = args.seed
+    seed_everything(seed)
+
+    # Resize model resolution as in gradio_demo.generate (based on first frame)
+    max_area = 1024 * 1024
+    oW, oH = person_imgs[0].width, person_imgs[0].height
+    ratio = math.sqrt(max_area / (oW * oH))
+    ratio = min(1, ratio)
+    tW, tH = int(oW * ratio) // 16 * 16, int(oH * ratio) // 16 * 16
+
+    transform_person = T.Compose([
+        T.Resize((tH, tW)),
+        T.ToTensor(),
+    ])
+
+    # Convert all person frames to a batched tensor
+    person_tensors = [transform_person(img) for img in person_imgs]
+    person_batch = torch.stack(person_tensors, dim=0)  # [N, 3, tH, tW]
+
+    # Prepare reference (object) image: resize + center-pad once, then repeat
+    object_image = ref_img_resized
+    ratio_obj = min(tW / object_image.width, tH / object_image.height)
+    transform_object = T.Compose([
+        T.Resize(
+            (int(object_image.height * ratio_obj), int(object_image.width * ratio_obj))
+        ),
+        T.ToTensor(),
+    ])
+    object_tensor = transform_object(object_image)  # [3, h', w']
+
+    object_padded_single = torch.ones_like(person_tensors[0])
+    new_h, new_w = object_tensor.shape[1], object_tensor.shape[2]
+    min_x = (tW - new_w) // 2
+    min_y = (tH - new_h) // 2
+    object_padded_single[:, min_y:min_y + new_h, min_x:min_x + new_w] = object_tensor
+
+    
+    # Repeat object for each frame
+    object_batch = object_padded_single.unsqueeze(0).repeat(person_batch.shape[0], 1, 1, 1)  # [N, 3, tH, tW]
+
+    # Build img_cond by interleaving [person, object] as in gradio_demo.generate
+    pairs = []
+    for p_img, o_img in zip(person_batch, object_batch):
+        pairs.append(p_img)
+        pairs.append(o_img)
+    img_cond = torch.stack(pairs, dim=0).to(
+        dtype=demo_mod.weight_dtype,
+        device=demo_mod.device,
+    )  # [2N, 3, tH, tW]
+    """
+    
+    # Build img_cond as (target_0, target_1, ..., target_{N-1}, reference)
+    num_frames = person_batch.shape[0]
+
+    # First all target frames
+    imgs = [p_img for p_img in person_batch]  # length N
+
+    # Then a single reference image at the end
+    # (object_padded_single has the same size as person_tensors[0])
+    imgs.append(object_padded_single)         # length N + 1
+
+    img_cond = torch.stack(imgs, dim=0).to(
+        dtype=demo_mod.weight_dtype,
+        device=demo_mod.device,
+    )  # [N+1, 3, tH, tW]
+    """
+
+    # Zero mask for all samples
+    mask = torch.zeros_like(img_cond, device=demo_mod.device)
+
+    # Prompts: same object text for every (person, object) pair
+    prompts = [demo_mod.args.object_map[args.obj_class]] * img_cond.shape[0]
+
+    # Run the FluxFill pipeline once for the whole batch
+    with torch.no_grad():
+        result = demo_mod.pipeline(
+            prompt=prompts,
+            height=tH,
+            width=tW,
+            img_cond=img_cond,
+            mask=mask,
+            guidance_scale=args.guidance,
+            num_inference_steps=args.steps,
+            generator=torch.Generator(demo_mod.device).manual_seed(seed),
+        )
+        all_images = result.images  # list of length 2N
+
+    # Take only the "person" outputs (0, 2, 4, ...) as edited frames
+    out_images: List[Image.Image] = [all_images[2 * i] for i in range(len(person_imgs))]
+    
+    # Take only the target outputs (first N entries) as edited frames
+    #num_frames = len(person_imgs)
+    #out_images: List[Image.Image] = list(all_images[:num_frames])
+
+    # ---- Save frames & (optional) video, as before ----
+    first_frame_size = None
+    for in_path, out_img in zip(frames_in, out_images):
+        # Normalize output to PIL.Image (should already be PIL from pipeline)
         if isinstance(out_img, (list, tuple)) and len(out_img) > 0:
             out_img = out_img[0]
         if not hasattr(out_img, "save"):
             arr = out_img
             if not isinstance(arr, np.ndarray):
-                raise TypeError("Unexpected output type from generate(); cannot save.")
+                raise TypeError("Unexpected output type from batched pipeline; cannot save.")
             if arr.dtype != np.uint8:
                 arr = (arr * 255).clip(0, 255).astype("uint8")
             out_img = Image.fromarray(arr)
 
         # Save per-frame
         if frames_out_dir is not None:
-            out_frame_path = frames_out_dir / in_path.name
-            if out_frame_path.exists() and not args.overwrite:
-                pass  # skip
-            else:
-                out_img.save(out_frame_path)
+            out_frame_idx = frames_in.index(in_path) + 1
+            out_frame_path = frames_out_dir / f"frame_{out_frame_idx:04d}.png"
+            out_img.save(out_frame_path)
+
+        # Write to video
+        if video_out is not None:
+            if writer is None:
+                w, h = out_img.size
+                first_frame_size = (w, h)
+                writer = cv2_writer(video_out, fps=args.fps, size=(w, h), codec=args.codec)
+
+            if out_img.size != first_frame_size:
+                out_img = out_img.resize(first_frame_size, Image.BICUBIC)
+
+            frame_bgr = pil_to_bgr(out_img)
+            writer.write(frame_bgr)
 
         """
         # Init writer lazily

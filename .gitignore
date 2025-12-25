@@ -4,3 +4,5 @@ checkpoints/
 run_video_frames_*.sh
 log.txt
 results/
+demo_example/
+cg_glasses/
