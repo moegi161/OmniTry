@@ -167,7 +167,7 @@ def run():
         raise RuntimeError(f"No input frames found at {args.person}")
 
     if args.max_frames is not None:
-        frames_in = frames_in[4: args.max_frames]
+        frames_in = frames_in[: args.max_frames]
         print(frames_in)
 
     is_dir_input = args.person.is_dir()

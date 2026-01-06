@@ -15,6 +15,7 @@ import os
 os.environ["GRADIO_TEMP_DIR"] = ".gradio"
 
 from omnitry.models.transformer_flux import FluxTransformer2DModel
+# from diffusers.models.transformers import FluxTransformer2DModel # use this line if you want to test vanilla diffusers version
 from omnitry.pipelines.pipeline_flux_fill import FluxFillPipeline
 
 
@@ -51,9 +52,49 @@ with safe_open(args.lora_path, framework="pt") as f:
     lora_weights = {k: f.get_tensor(k) for k in f.keys()}
     transformer.load_state_dict(lora_weights, strict=False)
 
+"""
+def create_hacked_forward(module):
+
+    def lora_forward(self, active_adapter, x, *args, **kwargs):
+        # Base linear
+        result = self.base_layer(x, *args, **kwargs)
+
+        # No adapter specified → just return base
+        if active_adapter is None:
+            return result
+
+        # Adapter not present for this layer → return base
+        if active_adapter not in self.lora_A:
+            return result
+
+        torch_result_dtype = result.dtype
+
+        lora_A = self.lora_A[active_adapter]
+        lora_B = self.lora_B[active_adapter]
+        # ModuleDict: use "in" and indexing instead of .get
+        if active_adapter in self.lora_dropout:
+            dropout = self.lora_dropout[active_adapter]
+        else:
+            dropout = None
+        scaling = self.scaling[active_adapter]
+
+        x_lora = x.to(lora_A.weight.dtype)
+        if dropout is not None:
+            x_lora = dropout(x_lora)
+
+        result = result + lora_B(lora_A(x_lora)) * scaling
+        result = result.to(torch_result_dtype)
+        return result
+
+    def hacked_lora_forward(self, x, *args, **kwargs):
+        # DEBUG: apply only vtryon_lora to ALL samples
+        return lora_forward(self, "vtryon_lora", x, *args, **kwargs)
+
+    return hacked_lora_forward.__get__(module, type(module))
 
 
 
+"""
 # hack lora forward
 def create_hacked_forward(module):
 
@@ -69,8 +110,14 @@ def create_hacked_forward(module):
             result = result + lora_B(lora_A(dropout(x))) * scaling
         return result
     
-    # Ianna; original version for two-sample batches
+    def hacked_lora_forward(self, x, *args, **kwargs):
+        # DEBUG: apply only vtryon_lora to all samples
+        return lora_forward(self, "vtryon_lora", x, *args, **kwargs)
+    
+    
+    
     """
+    # Ianna; original version for two-sample batches
     def hacked_lora_forward(self, x, *args, **kwargs):
         return torch.cat((
             lora_forward(self, 'vtryon_lora', x[:1], *args, **kwargs),
@@ -80,7 +127,7 @@ def create_hacked_forward(module):
     return hacked_lora_forward.__get__(module, type(module))
     """
 
-
+    
     # Ianna; alternative version supporting mixed batches
     def hacked_lora_forward(self, x, *args, **kwargs):
         
@@ -92,7 +139,6 @@ def create_hacked_forward(module):
         #  ...
         #So even indices -> vtryon_lora, odd indices -> garment_lora.
         
-
         b = x.shape[0]
         if b == 0:
             return x
@@ -126,8 +172,38 @@ def create_hacked_forward(module):
             ),
             dim=0,
         )
+    
+    return hacked_lora_forward.__get__(module, type(module))
+    
+    """
+    # Ianna: (target, target, ..., target, reference) layout
+    def hacked_lora_forward(self, x, *args, **kwargs):
+        
+        #Expected batch layout:
+        #  x[0..B-2] = targets (frames)
+        #  x[B-1]    = reference
+        
+
+        b = x.shape[0]
+        if b == 0:
+            return x
+
+        # single sample → treat as target
+        if b == 1:
+            return lora_forward(self, "vtryon_lora", x, *args, **kwargs)
+
+        n_targets = b - 1
+        x_target = x[:n_targets]
+        x_ref    = x[n_targets:]      # last element
+
+        y_target = lora_forward(self, "vtryon_lora", x_target, *args, **kwargs)
+        y_ref    = lora_forward(self, "garment_lora", x_ref,    *args, **kwargs)
+
+        # output has same shape as y_target / y_ref
+        return torch.cat([y_target, y_ref], dim=0)
 
     return hacked_lora_forward.__get__(module, type(module))
+    """
     
 
 for n, m in transformer.named_modules():

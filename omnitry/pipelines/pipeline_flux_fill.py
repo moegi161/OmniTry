@@ -144,6 +144,8 @@ class FluxFillPipeline(FluxPipeline):
         device,
         generator,
     ):
+
+        print(f"Preparing mask latents. Mask shape: {mask.shape}, masked_image shape: {masked_image.shape} Batch size: {batch_size} height: {height}, width: {width}")
         # 1. calculate the height and width of the latents
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
@@ -209,6 +211,7 @@ class FluxFillPipeline(FluxPipeline):
         )
         mask = mask.to(device=device, dtype=dtype)
 
+        print(f"Prepared mask latents. Mask shape: {mask.shape}, masked_image_latents shape: {masked_image_latents.shape}")
         return mask, masked_image_latents
 
     # Copied from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3_img2img.StableDiffusion3Img2ImgPipeline.get_timesteps
@@ -357,6 +360,8 @@ class FluxFillPipeline(FluxPipeline):
             batch_size = len(prompt)
         else:
             batch_size = prompt_embeds.shape[0]
+            
+        print(f"Call: Batch size: {batch_size}")
 
         device = self._execution_device
 
@@ -411,6 +416,8 @@ class FluxFillPipeline(FluxPipeline):
             generator,
         )
         masked_image_latents = torch.cat((masked_image_latents, mask), dim=-1)
+        
+        print(f"Call: latents shape: {latents.shape}, masked_image_latents shape: {masked_image_latents.shape}, image cond shape: {img_cond.shape}, mask shape: {mask.shape}, height: {height}, width: {width}")
 
         # 5. Prepare timesteps
         sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
@@ -465,8 +472,6 @@ class FluxFillPipeline(FluxPipeline):
                     img_ids=latent_image_ids,
                     joint_attention_kwargs=self.joint_attention_kwargs,
                     return_dict=False,
-                    temporal_mode=True, #Ianna: <--- NEW
-                    frames_per_video=T, #Ianna: <--- NEW
                 )[0]
 
                 # compute the previous noisy sample x_t -> x_t-1

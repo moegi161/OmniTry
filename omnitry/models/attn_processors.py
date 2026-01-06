@@ -203,45 +203,44 @@ class FluxAttnProcessor2_0:
         
         # shared attention / temporal attention across batch:
         # assume batch = (target_0, ..., target_{T-1}, reference)
-        txt_len = 512  # boundary between text and image tokens
+        if encoder_hidden_states is not None:
+            txt_len = encoder_hidden_states.shape[1] #Ianna: length of text tokens, originally hardcoded to 512
+        else:
+            txt_len = 0
 
-        #B = key.shape[0]
-        #ref_idx = B - 1
-        #T = B - 1  # number of targets
+        """
+        B = key.shape[0]
+        ref_idx = B - 1
+        T = B - 1  # number of targets
 
         # Example: each target attends to all other targets + reference
-        #donors = [[] for _ in range(B)]
-        #for i in range(T):
-        #    # all other targets + ref
+        donors = [[] for _ in range(B)]
+        for i in range(T):
+            donors[i] = [ref_idx]   # target i sees reference only
+            # all other targets + ref
         #    neighbors = [j for j in range(T) if j != i]
         #    donors[i] = neighbors + [ref_idx]
         
         # keep reference unchanged (or set donors[ref_idx] if you want symmetric coupling)
-        #donors[ref_idx] = []
+        donors[ref_idx] = []
 
-            
+        """    
         B, H, L, D = key.shape
         assert B % 2 == 0, "Expect (target, ref, target, ref, ...)"
         num_pairs = B // 2
-        anchor_pair = 0                  # use frame_0 as global anchor
-        anchor_t_idx = 2 * anchor_pair   # batch index of anchor target
-
+        t_indices = [2 * p for p in range(num_pairs)]
+        r_indices = [2 * p + 1 for p in range(num_pairs)]
 
         donors = [[] for _ in range(B)]
         for p in range(num_pairs):
-            t_idx = 2 * p      # target batch index
-            r_idx = 2 * p + 1  # reference batch index
+            t_idx = 2 * p
+            r_idx = 2 * p + 1
 
-            if p == anchor_pair:
-                # anchor frame: only its own reference
-                donors[t_idx] = [r_idx]
-            else:
-                # other frames: own ref + anchor target
-                donors[t_idx] = [r_idx, anchor_t_idx]
+            other_targets = [t for t in t_indices if t != t_idx]
 
-            # keep refs passive (no extra donors)
-            donors[r_idx] = []
-            
+            donors[t_idx] = [r_idx] + other_targets   # tar gets: its ref + other tars (image tokens only)
+            donors[r_idx] = []                        # refs stay passive
+
         
 
         key, value, k_lens = build_shared_kv(key, value, txt_len=txt_len, donors=donors)

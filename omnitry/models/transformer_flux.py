@@ -37,6 +37,7 @@ from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddin
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 
 from .attn_processors import FluxAttnProcessor2_0
+#from diffusers.models.attention_processor import FluxAttnProcessor2_0  # Ianna: vanilla diffusers version
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -289,7 +290,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         joint_attention_dim: int = 4096,
         pooled_projection_dim: int = 768,
         guidance_embeds: bool = False,
-        axes_dims_rope: Tuple[int] = (16, 56, 56),
+        axes_dims_rope: Tuple[int] = (96, 336, 336),  # (16, 56, 56),
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -438,52 +439,6 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
     def _set_gradient_checkpointing(self, module, value=False):
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
-            
-    # Ianna: NEW
-    def _temporal_sa_even_only(self, block, hidden_states, txt_len: int):
-        """
-        Apply temporal self-attention ONLY on even batch indices, ONLY on image tokens.
-        hidden_states: [B=2T, N_img, D]  (this is the image stream, NOT including text)
-        txt_len is not used here because hidden_states is already image-only.
-        """
-        B, N, D = hidden_states.shape
-        if B % 2 != 0:
-            return hidden_states  # safety
-        T = B // 2
-
-        even = hidden_states[0::2]  # [T, N, D]
-
-        # Flatten time into sequence: [1, T*N, D]
-        x = even.reshape(1, T * N, D)
-
-        # Reuse the SAME self-attn weights from this block (qkv + out projection)
-        attn = block.attn  # Attention module inside FluxTransformerBlock
-
-        q = attn.to_q(x)
-        k = attn.to_k(x)
-        v = attn.to_v(x)
-
-        head_dim = q.shape[-1] // attn.heads
-        # [1, heads, L, head_dim]
-        q = q.view(1, -1, attn.heads, head_dim).transpose(1, 2)
-        k = k.view(1, -1, attn.heads, head_dim).transpose(1, 2)
-        v = v.view(1, -1, attn.heads, head_dim).transpose(1, 2)
-
-        # plain SDPA (no RoPE, no varlen) for temporal mixing
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
-        )
-        # back to [1, L, D]
-        y = y.transpose(1, 2).reshape(1, T * N, attn.heads * head_dim)
-        y = attn.to_out[0](y)  # out projection
-        y = attn.to_out[1](y)  # dropout (usually no-op in eval)
-
-        # residual update on even indices only
-        y = y.reshape(T, N, D)
-        hidden_states = hidden_states.clone()
-        hidden_states[0::2] = hidden_states[0::2] + y
-
-        return hidden_states
 
 
     def forward(
@@ -499,9 +454,6 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         img_shapes: list = None,
         img_lens: list = None,
         return_dict: bool = True,
-        temporal_mode: bool = False,  # Ianna: NEW
-        frames_per_video: int = 1,  # Ianna: NEW
-        temporal_layer_idx: int = 12,  # Ianna: NEW
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -561,18 +513,25 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         )
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
 
+        
         if txt_ids.ndim == 2:
             txt_ids = txt_ids[None].repeat(bsz, 1, 1)
         if img_ids.ndim == 2:
             img_ids = img_ids[None].repeat(bsz, 1, 1)
 
         # shift pos id
-        max_w = img_ids[:, :, 2].max().item()
+        max_w = img_ids[:, :, 2].max().item() + 1  # Ianna: +1 for correct indexing
+        
+        # Ianna: we assume our input is (tar1, ref1, tar2, ref2, ...)
         for b in range(bsz):
             img_ids[b, :, 0] = b  
             txt_ids[b, :, 0] = b
-            img_ids[b, :, 2] += b * max_w
+            if b % 2 != 0:
+                # reference frame
+                img_ids[b, :, 2] += max_w # Ianna: shift ref w by max_w (if b is odd, width shift by max_w)
+            # img_ids[b, :, 2] += b * max_w # original omnitry version
                 
+        
         # prepare rope embedding
         image_rotary_emb = torch.stack([
             self.pos_embed(torch.cat([t_id, i_id], dim=0))
