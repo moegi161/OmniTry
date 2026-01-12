@@ -254,7 +254,7 @@ def run():
     min_y = (tH - new_h) // 2
     object_padded_single[:, min_y:min_y + new_h, min_x:min_x + new_w] = object_tensor
 
-    
+    """
     # Repeat object for each frame
     object_batch = object_padded_single.unsqueeze(0).repeat(person_batch.shape[0], 1, 1, 1)  # [N, 3, tH, tW]
 
@@ -283,7 +283,7 @@ def run():
         dtype=demo_mod.weight_dtype,
         device=demo_mod.device,
     )  # [N+1, 3, tH, tW]
-    """
+    
 
     # Zero mask for all samples
     mask = torch.zeros_like(img_cond, device=demo_mod.device)
@@ -306,11 +306,11 @@ def run():
         all_images = result.images  # list of length 2N
 
     # Take only the "person" outputs (0, 2, 4, ...) as edited frames
-    out_images: List[Image.Image] = [all_images[2 * i] for i in range(len(person_imgs))]
+    # out_images: List[Image.Image] = [all_images[2 * i] for i in range(len(person_imgs))]
     
     # Take only the target outputs (first N entries) as edited frames
-    #num_frames = len(person_imgs)
-    #out_images: List[Image.Image] = list(all_images[:num_frames])
+    num_frames = len(person_imgs)
+    out_images: List[Image.Image] = list(all_images[:num_frames])
 
     # ---- Save frames & (optional) video, as before ----
     first_frame_size = None

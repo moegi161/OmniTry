@@ -519,6 +519,7 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         if img_ids.ndim == 2:
             img_ids = img_ids[None].repeat(bsz, 1, 1)
 
+        """
         # shift pos id
         max_w = img_ids[:, :, 2].max().item() + 1  # Ianna: +1 for correct indexing
         
@@ -530,7 +531,26 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                 # reference frame
                 img_ids[b, :, 2] += max_w # Ianna: shift ref w by max_w (if b is odd, width shift by max_w)
             # img_ids[b, :, 2] += b * max_w # original omnitry version
-                
+        """
+        # Assume:
+        # - bsz = n_targets + 1
+        # - ordering: [tar1, tar2, ..., tar_n, ref]
+        # - last index (bsz - 1) is the reference
+
+        ref_idx = bsz - 1
+
+        # Compute max_w from the reference BEFORE any shift.
+        # (If you compute from all items after shifting, you can accidentally double-count.)
+        ref_max_w = img_ids[ref_idx, :, 2].max().item() + 1  # +1 for correct indexing
+
+        #for b in range(bsz):
+        #    # set "t-id"/batch-id slot
+        #    img_ids[b, :, 0] = b
+        #    txt_ids[b, :, 0] = b
+
+        # shift only the reference width coordinate
+        img_ids[ref_idx, :, 2] += ref_max_w
+        
         
         # prepare rope embedding
         image_rotary_emb = torch.stack([

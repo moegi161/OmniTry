@@ -208,7 +208,7 @@ class FluxAttnProcessor2_0:
         else:
             txt_len = 0
 
-        """
+        
         B = key.shape[0]
         ref_idx = B - 1
         T = B - 1  # number of targets
@@ -236,17 +236,14 @@ class FluxAttnProcessor2_0:
             t_idx = 2 * p
             r_idx = 2 * p + 1
 
-            other_targets = [t for t in t_indices if t != t_idx]
+            other_targets = [t for t in t_indices if t != t_idx] 
 
-            donors[t_idx] = [r_idx] + other_targets   # tar gets: its ref + other tars (image tokens only)
+            donors[t_idx] = [r_idx] #+ other_targets   # tar gets: its ref 
             donors[r_idx] = []                        # refs stay passive
 
-        
-
+        """
         key, value, k_lens = build_shared_kv(key, value, txt_len=txt_len, donors=donors)
-
         
-        #print("after hacked shared attention:", query.shape, key.shape, value.shape, q_lens, k_lens)
         
         # core attention
         if FLASH_ATTN_AVALIABLE:
@@ -282,7 +279,7 @@ class FluxAttnProcessor2_0:
             hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
 
         hidden_states = hidden_states.to(query.dtype)
-
+        
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
                 hidden_states[:, : encoder_hidden_states.shape[1]],

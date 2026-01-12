@@ -110,13 +110,12 @@ def create_hacked_forward(module):
             result = result + lora_B(lora_A(dropout(x))) * scaling
         return result
     
+    """
     def hacked_lora_forward(self, x, *args, **kwargs):
         # DEBUG: apply only vtryon_lora to all samples
         return lora_forward(self, "vtryon_lora", x, *args, **kwargs)
     
-    
-    
-    """
+
     # Ianna; original version for two-sample batches
     def hacked_lora_forward(self, x, *args, **kwargs):
         return torch.cat((
@@ -125,7 +124,7 @@ def create_hacked_forward(module):
         ), dim=0)
     
     return hacked_lora_forward.__get__(module, type(module))
-    """
+    
 
     
     # Ianna; alternative version supporting mixed batches
@@ -178,11 +177,9 @@ def create_hacked_forward(module):
     """
     # Ianna: (target, target, ..., target, reference) layout
     def hacked_lora_forward(self, x, *args, **kwargs):
-        
         #Expected batch layout:
         #  x[0..B-2] = targets (frames)
         #  x[B-1]    = reference
-        
 
         b = x.shape[0]
         if b == 0:
@@ -203,7 +200,7 @@ def create_hacked_forward(module):
         return torch.cat([y_target, y_ref], dim=0)
 
     return hacked_lora_forward.__get__(module, type(module))
-    """
+    
     
 
 for n, m in transformer.named_modules():
