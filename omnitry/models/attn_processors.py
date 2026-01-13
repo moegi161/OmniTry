@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
+import math
 
 #try:
 #    from flash_attn import flash_attn_varlen_func
@@ -218,8 +219,8 @@ class FluxAttnProcessor2_0:
         for i in range(T):
             donors[i] = [ref_idx]   # target i sees reference only
             # all other targets + ref
-        #    neighbors = [j for j in range(T) if j != i]
-        #    donors[i] = neighbors + [ref_idx]
+            #neighbors = [j for j in range(T) if j != i]
+            #donors[i] = neighbors + [ref_idx]
         
         # keep reference unchanged (or set donors[ref_idx] if you want symmetric coupling)
         donors[ref_idx] = []
@@ -279,6 +280,114 @@ class FluxAttnProcessor2_0:
             hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
 
         hidden_states = hidden_states.to(query.dtype)
+        
+        # ===================== Ianna: Stage-B temporal attention (targets <-> targets, no params) =====================
+        donors_B = [[] for _ in range(B)]
+        for i in range(T):
+            # all other targets
+            neighbors = [j for j in range(T) if abs(j - i) <= 1 and j != i]  # window size = 2
+            donors_B[i] = neighbors
+        # refs stay passive: donors_B[ref_idx] = [] by construction
+
+        # Use Stage-A output as input to temporal attention
+        hidden_states_stage1 = hidden_states  # (B, L_max, H*D)
+
+         # ===================== Ianna: Stage-B temporal attention (targets <-> targets, memory-efficient) =====================
+        # donors_B is already built above:
+        #   donors_B[i] = all other targets for target i
+        #   donors_B[ref_idx] remains []  (refs passive)
+
+        hidden_states_stage1 = hidden_states  # (B, L_max, H*D)
+
+        B2, L_max, HD = hidden_states_stage1.shape
+        H = attn.heads
+        head_dim = HD // H
+        assert B2 == B, "Batch size mismatch between Stage A and Stage B"
+
+        # Treat Stage-A hidden states as Q=K=V (no extra projections, no learnable params)
+        # (B, L_max, H*D) -> (B, H, L_max, D)
+        qkv = hidden_states_stage1.view(B2, L_max, H, head_dim).permute(0, 2, 1, 3)
+        query_t = qkv
+        key_t   = qkv
+        value_t = qkv
+
+        # Build shared K/V across targets only
+        key_t, value_t, k_lens_B = build_shared_kv(
+            key_t, value_t, txt_len=txt_len, donors=donors_B
+        )
+        q_lens_B = q_lens  # same query lengths as Stage A
+
+        # Core temporal attention (reuse FlashAttention / SDPA, no manual QK^T)
+        if FLASH_ATTN_AVALIABLE:
+            # flash-attn expects (B, L, H, D)
+            query_fb = query_t.permute(0, 2, 1, 3)  # (B, L_max, H, D)
+            key_fb   = key_t.permute(0, 2, 1, 3)    # (B, L_max_K, H, D)
+            value_fb = value_t.permute(0, 2, 1, 3)
+
+            # pack variable-length sequences
+            packed_q = torch.cat([u[:l] for u, l in zip(query_fb, q_lens_B)], dim=0)
+            packed_k = torch.cat([u[:l] for u, l in zip(key_fb,   k_lens_B)], dim=0)
+            packed_v = torch.cat([u[:l] for u, l in zip(value_fb, k_lens_B)], dim=0)
+
+            cu_seqlens_q_B = F.pad(q_lens_B.cumsum(dim=0), (1, 0)).to(torch.int32)
+            cu_seqlens_k_B = F.pad(k_lens_B.cumsum(dim=0), (1, 0)).to(torch.int32)
+            max_seqlen_q_B = int(q_lens_B.max().item())
+            max_seqlen_k_B = int(k_lens_B.max().item())
+
+            hs_flat = flash_attn_varlen_func(
+                packed_q,
+                packed_k,
+                packed_v,
+                cu_seqlens_q_B,
+                cu_seqlens_k_B,
+                max_seqlen_q_B,
+                max_seqlen_k_B,
+            )  # (sum_q, H, D)
+
+            # unpack back to (B, L_max, H, D)
+            hs_padded = pad_sequence(
+                [
+                    hs_flat[start:end]
+                    for start, end in zip(cu_seqlens_q_B[:-1], cu_seqlens_q_B[1:])
+                ],
+                batch_first=True,
+            )  # (B, L_max, H, D)
+            hidden_states_B = hs_padded.reshape(B2, L_max, H * head_dim)
+
+        else:
+            # SDPA path: query_t/key_t/value_t are (B, H, L, D)
+            attn_mask_B = torch.zeros(
+                (B2, 1, query_t.size(2), key_t.size(2)),
+                dtype=torch.bool,
+                device=query_t.device,
+            )
+            for i, (q_len_i, k_len_i) in enumerate(zip(q_lens_B, k_lens_B)):
+                attn_mask_B[i, :, :q_len_i, :k_len_i] = True
+
+            hs = F.scaled_dot_product_attention(
+                query_t, key_t, value_t,
+                attn_mask=attn_mask_B,
+                dropout_p=0.0,
+                is_causal=False,
+            )  # (B, H, L_max, D)
+
+            hidden_states_B = hs.transpose(1, 2).reshape(
+                B2, L_max, H * head_dim
+            )  # (B, L_max, H*D)
+
+        hidden_states_B = hidden_states_B.to(hidden_states_stage1.dtype)
+
+        # Make reference truly passive: keep its Stage-A representation
+        ref_len = q_lens_B[ref_idx].item()
+        hidden_states_B[ref_idx, :ref_len] = hidden_states_stage1[ref_idx, :ref_len]
+
+        # Blend Stage-B with Stage-A via a residual to avoid over-smoothing
+        lambda_t = 0.7  # you can tune this (0.1–0.7)
+        hidden_states = hidden_states_stage1 + lambda_t * (hidden_states_B - hidden_states_stage1)
+        # ===================== End Stage-B temporal attention =====================
+
+
+
         
         if encoder_hidden_states is not None:
             encoder_hidden_states, hidden_states = (
