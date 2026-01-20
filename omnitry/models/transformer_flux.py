@@ -486,6 +486,12 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
             lora_scale = joint_attention_kwargs.pop("scale", 1.0)
         else:
             lora_scale = 1.0
+        # pull flow guidance off the kwargs and stash it on processors to avoid warnings
+        flow_fields = None
+        flow_donors = None
+        if joint_attention_kwargs is not None:
+            flow_fields = joint_attention_kwargs.pop("flow_fields", None)
+            flow_donors = joint_attention_kwargs.pop("flow_donors", None)
 
         if USE_PEFT_BACKEND:
             # weight the lora layers by setting `lora_scale` for each PEFT layer
@@ -495,6 +501,15 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                 logger.warning(
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
+
+        if flow_fields is not None or flow_donors is not None:
+            # set flow guidance on all attention processors
+            for blk in self.transformer_blocks:
+                if hasattr(blk.attn, "processor") and hasattr(blk.attn.processor, "set_flow"):
+                    blk.attn.processor.set_flow(flow_fields, flow_donors)
+            for blk in self.single_transformer_blocks:
+                if hasattr(blk.attn, "processor") and hasattr(blk.attn.processor, "set_flow"):
+                    blk.attn.processor.set_flow(flow_fields, flow_donors)
 
         # patchify
         hidden_states = self.x_embedder(hidden_states)

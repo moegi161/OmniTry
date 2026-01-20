@@ -43,7 +43,9 @@ from tqdm import tqdm
 import torch
 import math
 import torchvision.transforms as T
+from optical_flow_utils import compute_flow_guidance
 
+from optical_flow_utils import *
 
 # Optional natural sort
 try:
@@ -51,6 +53,7 @@ try:
     def natsorted(x): return _natsorted(x)
 except Exception:
     def natsorted(x): return sorted(x)
+    
 
 
 def load_module_from_path(py_path: Path, module_name: str = "gradio_demo"):
@@ -137,6 +140,8 @@ def run():
     ap.add_argument("--guidance", type=float, default=30.0, help="Guidance scale (default: 30.0)")
     ap.add_argument("--seed", type=int, default=-1, help="Random seed; -1 for random (default: -1)")
     ap.add_argument("--demo-path", type=Path, default=None, help="(Optional) Explicit path to gradio_demo.py")
+    ap.add_argument("--flow-guidance", action="store_true", help="Enable RAFT flow-guided temporal attention")
+    ap.add_argument("--flow-resize", type=int, default=None, help="Optional square resize before RAFT to save compute (e.g., 256)")
     args = ap.parse_args()
 
     # Resolve and import gradio_demo
@@ -291,6 +296,23 @@ def run():
     # Prompts: same object text for every (person, object) pair
     prompts = [demo_mod.args.object_map[args.obj_class]] * img_cond.shape[0]
 
+    # Optional RAFT flow guidance for temporal attention
+    joint_attention_kwargs = None
+    if args.flow_guidance:
+        try:
+            flow_info = compute_flow_guidance(
+                person_imgs,
+                device=demo_mod.device,
+                resize_to=args.flow_resize,
+            )
+            if flow_info is not None and flow_info.get("donors_temp", None) is not None:
+                joint_attention_kwargs = {
+                    "flow_fields": flow_info.get("flow_fields"),
+                }
+                print("Flow guidance enabled with per-token flow fields.")
+        except Exception as e:
+            print(f"[warn] Flow guidance disabled due to error: {e}")
+
     # Run the FluxFill pipeline once for the whole batch
     with torch.no_grad():
         result = demo_mod.pipeline(
@@ -302,6 +324,7 @@ def run():
             guidance_scale=args.guidance,
             num_inference_steps=args.steps,
             generator=torch.Generator(demo_mod.device).manual_seed(seed),
+            joint_attention_kwargs=joint_attention_kwargs,
         )
         all_images = result.images  # list of length 2N
 

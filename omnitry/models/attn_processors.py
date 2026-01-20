@@ -114,6 +114,13 @@ class FluxAttnProcessor2_0:
     def __init__(self):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
+        self._flow_fields = None
+        self._flow_donors = None
+
+    def set_flow(self, flow_fields=None, flow_donors=None):
+        # store flow guidance on the processor; avoids passing via kwargs that trigger warnings upstream
+        self._flow_fields = flow_fields
+        self._flow_donors = flow_donors
 
     def _run_attn_group(self, query_g, key_g, value_g, q_lens_g, k_lens_g, attn, head_dim):
         """
@@ -174,6 +181,7 @@ class FluxAttnProcessor2_0:
         attention_mask=None,
         image_rotary_emb=None,
         lens=None,
+        **kwargs,
     ) -> torch.FloatTensor:
         batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
 
@@ -277,13 +285,28 @@ class FluxAttnProcessor2_0:
         """
         
         # ------------------- Per-head specialization setup -------------------
+
+        Lq_total = query.shape[2]
+        assert txt_len <= Lq_total, f"txt_len {txt_len} > seq_len {Lq_total}"
+        
         B = key.shape[0]
         ref_idx = B - 1
         T = B - 1
 
+        # Head split indices
         H_total = attn.heads
-        H_temp = max(1, H_total // 4)          # e.g. 1/4 heads for temporal
+        H_temp = max(1, H_total // 2)
         H_fid = H_total - H_temp
+
+        # Split heads on full sequence first
+        q_temp_full = query[:, :H_temp]   # (B, H_temp, L, D)
+        k_temp_full = key[:,   :H_temp]
+        v_temp_full = value[:, :H_temp]
+
+        q_fid_full  = query[:, H_temp:]   # (B, H_fid, L, D)
+        k_fid_full  = key[:,   H_temp:]
+        v_fid_full  = value[:, H_temp:]
+
         
         # donors for fidelity heads: ref only
         donors_fid = [[] for _ in range(B)]
@@ -291,38 +314,146 @@ class FluxAttnProcessor2_0:
             donors_fid[i] = [ref_idx]
         donors_fid[ref_idx] = []
         
-        # donors for temporal heads: ref + neighbors
+        # donors for temporal heads: ref + neighbors (override-able by flow)
+        flow_fields = self._flow_fields  # optional: (T-1, 2, Hf, Wf)
         donors_temp = [[] for _ in range(B)]
         for i in range(T):
-            neighbors = []
-            # all other targets + ref
-            neighbors = [j for j in range(T) if j != i]
+            neighbors = [j for j in range(T) if abs(j - i) <= 5]  # temporal window include self and neighbors
             donors_temp[i] = neighbors + [ref_idx]
         donors_temp[ref_idx] = []
         
-        # Split heads
-        query_temp = query[:, :H_temp]        # (B, H_temp, Lq, D)
-        key_temp   = key[:, :H_temp]
-        value_temp = value[:, :H_temp]
-
-        query_fid  = query[:, H_temp:]        # (B, H_fid, Lq, D)
-        key_fid    = key[:, H_temp:]
-        value_fid  = value[:, H_temp:]
 
         # Build K/V separately per head group (this is where routing differs)
-        key_temp, value_temp, k_lens_temp = build_shared_kv(key_temp, value_temp, txt_len=txt_len, donors=donors_temp)
-        key_fid,  value_fid,  k_lens_fid  = build_shared_kv(key_fid,  value_fid,  txt_len=txt_len, donors=donors_fid)
+        # Expand K/V for image tokens only (txt_len=0 because we already sliced)
+        k_fid, v_fid, k_lens_fid = build_shared_kv(k_fid_full, v_fid_full, txt_len=txt_len, donors=donors_fid)
+        q_fid = q_fid_full
+        q_lens_fid = q_lens
+        
+        q_temp = q_temp_full[:, :, txt_len:, :]          # (B, H_temp, L_img, D)
+        q_lens_temp = (q_lens - txt_len).clamp(min=0)    # valid query lengths for image part
 
-        # Query length stays the same
-        q_lens_g = q_lens
+        use_flow = flow_fields is not None
+        if use_flow:
+            if not isinstance(flow_fields, torch.Tensor):
+                flow_fields = torch.tensor(flow_fields)
+            use_flow = flow_fields.numel() > 0
+        if use_flow:
+            # flow-based per-token donors
+            flow_fields = flow_fields.to(q_temp.device)
+            # L_img should form a square grid
+            L_img = q_temp.shape[2]
+            H_tok = int(math.sqrt(L_img))
+            W_tok = H_tok if H_tok * H_tok == L_img else None
+            if W_tok is None:
+                use_flow = False
+            else:
+                # resize flow to token grid and scale displacement to token units
+                flow_resized = torch.nn.functional.interpolate(
+                    flow_fields, size=(H_tok, H_tok), mode="bilinear", align_corners=False
+                )
+                if flow_fields.shape[-1] > 0:
+                    scale_w = H_tok / flow_fields.shape[-1]
+                    scale_h = H_tok / flow_fields.shape[-2]
+                else:
+                    scale_w = scale_h = 1.0
+                flow_resized[:, 0] *= scale_w
+                flow_resized[:, 1] *= scale_h
+
+                # precompute grid
+                y_coords = torch.arange(H_tok, device=q_temp.device)
+                x_coords = torch.arange(H_tok, device=q_temp.device)
+                grid_y, grid_x = torch.meshgrid(y_coords, x_coords, indexing="ij")
+                flat_coords = (grid_y.reshape(-1), grid_x.reshape(-1))
+
+                k_temp_list = []
+                v_temp_list = []
+                k_lens_temp = []
+
+                for i in range(B):
+                    # donors may vary per frame; collect raw then pad
+                    if i == ref_idx:
+                        donor_frames = [ref_idx]
+                        donor_idx_list = [flat_coords[0] * W_tok + flat_coords[1]]
+                    else:
+                        donor_frames = []
+                        donor_idx_list = []
+                        # self frame (identity)
+                        donor_frames.append(i)
+                        donor_idx_list.append((grid_y * W_tok + grid_x).reshape(-1))
+                        # prev flow
+                        if i > 0:
+                            flow_prev = flow_resized[i - 1]
+                            prev_y = torch.clamp((grid_y - flow_prev[1]).round().long(), 0, H_tok - 1)
+                            prev_x = torch.clamp((grid_x - flow_prev[0]).round().long(), 0, H_tok - 1)
+                            donor_frames.append(i - 1)
+                            donor_idx_list.append((prev_y * W_tok + prev_x).reshape(-1))
+                        # next flow
+                        if i < T - 1:
+                            flow_next = flow_resized[i]
+                            next_y = torch.clamp((grid_y + flow_next[1]).round().long(), 0, H_tok - 1)
+                            next_x = torch.clamp((grid_x + flow_next[0]).round().long(), 0, H_tok - 1)
+                            donor_frames.append(i + 1)
+                            donor_idx_list.append((next_y * W_tok + next_x).reshape(-1))
+                        # reference (same coords)
+                        donor_frames.append(ref_idx)
+                        donor_idx_list.append((grid_y * W_tok + grid_x).reshape(-1))
+
+                    # gather and concat along sequence
+                    gathered_k = []
+                    gathered_v = []
+                    for frm, idxs in zip(donor_frames, donor_idx_list):
+                        k_src = k_temp_full[frm, :, txt_len:, :]  # (H_temp, L_img, D)
+                        v_src = v_temp_full[frm, :, txt_len:, :]
+                        gathered_k.append(k_src[:, idxs, :])
+                        gathered_v.append(v_src[:, idxs, :])
+
+                    k_cat = torch.cat(gathered_k, dim=1)  # (H_temp, L_img * n_donors, D)
+                    v_cat = torch.cat(gathered_v, dim=1)
+                    k_temp_list.append(k_cat)
+                    v_temp_list.append(v_cat)
+                    k_lens_temp.append(k_cat.shape[1])
+
+                max_Lk = max(k_lens_temp)
+                k_temp_padded = []
+                v_temp_padded = []
+                for k_cat, v_cat in zip(k_temp_list, v_temp_list):
+                    if k_cat.shape[1] < max_Lk:
+                        pad_len = max_Lk - k_cat.shape[1]
+                        k_cat = torch.cat([k_cat, k_cat.new_zeros((k_cat.shape[0], pad_len, k_cat.shape[2]))], dim=1)
+                        v_cat = torch.cat([v_cat, v_cat.new_zeros((v_cat.shape[0], pad_len, v_cat.shape[2]))], dim=1)
+                    k_temp_padded.append(k_cat)
+                    v_temp_padded.append(v_cat)
+
+                k_temp = torch.stack(k_temp_padded, dim=0)  # (B, H_temp, Lk, D)
+                v_temp = torch.stack(v_temp_padded, dim=0)
+                k_lens_temp = torch.tensor(k_lens_temp, device=k_temp.device, dtype=torch.long)
+        if not use_flow:
+            k_temp, v_temp, k_lens_temp = build_shared_kv(k_temp_full, v_temp_full, txt_len=txt_len, donors=donors_temp)
+
 
         # Run attention twice (memory-efficient kernels)
-        hs_temp = self._run_attn_group(query_temp, key_temp, value_temp, q_lens_g, k_lens_temp, attn, head_dim)  # (B, Lmax, H_temp*D)
-        hs_fid  = self._run_attn_group(query_fid,  key_fid,  value_fid,  q_lens_g, k_lens_fid,  attn, head_dim)  # (B, Lmax, H_fid*D)
+        hs_temp_img = self._run_attn_group(q_temp, k_temp, v_temp, q_lens_temp, k_lens_temp, attn, head_dim)
+        hs_fid_full = self._run_attn_group(q_fid,  k_fid,  v_fid,  q_lens_fid,  k_lens_fid,  attn, head_dim)
 
-        # Concatenate head groups back in the original head order
-        hidden_states = torch.cat([hs_temp, hs_fid], dim=-1)  # (B, Lmax, H_total*D)
+        # Concatenate heads back for image tokens
+        # Split fidelity output into text/image parts
+        hs_fid_txt = hs_fid_full[:, :txt_len, :]     # (B, txt_len, H_fid*D)
+        hs_fid_img = hs_fid_full[:, txt_len:, :]     # (B, L_img,  H_fid*D)
+
+        # Build full outputs
+        hs_img = torch.cat([hs_temp_img, hs_fid_img], dim=-1)   # (B, L_img, H_total*D)
+        
+        # Compose text output: must also be (B, txt_len, H_total*D)
+        if txt_len > 0:
+            pad_txt = hs_fid_txt.new_zeros((B, txt_len, H_temp * head_dim))
+            hs_txt  = torch.cat([pad_txt, hs_fid_txt], dim=-1)   # (B, txt_len, H_total*D)
+        else:
+            hs_txt = hs_img.new_zeros((B, 0, H_total * head_dim))  # (B, 0, 3072)
+
+        hidden_states = torch.cat([hs_txt, hs_img], dim=1)      # (B, L_full, H_total*D)
         hidden_states = hidden_states.to(query.dtype)
+
+
         # ------------------- End per-head specialization -------------------
         
         """
