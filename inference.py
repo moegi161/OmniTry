@@ -142,6 +142,8 @@ def run():
     ap.add_argument("--demo-path", type=Path, default=None, help="(Optional) Explicit path to gradio_demo.py")
     ap.add_argument("--flow-guidance", action="store_true", help="Enable RAFT flow-guided temporal attention")
     ap.add_argument("--flow-resize", type=int, default=None, help="Optional square resize before RAFT to save compute (e.g., 256)")
+    ap.add_argument("--anchor-frame", type=Path, default=None, help="Optional pre-edited anchor frame to use as extra reference")
+    ap.add_argument("--anchor-weight", type=float, default=1.0, help="Weight/bias for anchor donors (>=1). Uses duplication of anchor in donor list")
     args = ap.parse_args()
 
     # Resolve and import gradio_demo
@@ -274,7 +276,7 @@ def run():
     )  # [2N, 3, tH, tW]
     """
     
-    # Build img_cond as (target_0, target_1, ..., target_{N-1}, reference)
+    # Build img_cond as (target_0, target_1, ..., target_{N-1}, reference [, anchor])
     num_frames = person_batch.shape[0]
 
     # First all target frames
@@ -282,12 +284,20 @@ def run():
 
     # Then a single reference image at the end
     # (object_padded_single has the same size as person_tensors[0])
-    imgs.append(object_padded_single)         # length N + 1
+    imgs.append(object_padded_single)         # reference, length N + 1
+
+    # Optional anchor frame (pre-edited best frame)
+    if args.anchor_frame is not None:
+        anchor_img = ensure_rgb(Image.open(args.anchor_frame))
+        anchor_img = anchor_img.resize((tW, tH), Image.BICUBIC)
+        anchor_tensor = transform_person(anchor_img)
+        imgs.append(anchor_tensor)
+        print(f"Anchor frame added: {args.anchor_frame}")
 
     img_cond = torch.stack(imgs, dim=0).to(
         dtype=demo_mod.weight_dtype,
         device=demo_mod.device,
-    )  # [N+1, 3, tH, tW]
+    )  # [N+1, 3, tH, tW] or [N+2, ...]
     
 
     # Zero mask for all samples
@@ -297,7 +307,7 @@ def run():
     prompts = [demo_mod.args.object_map[args.obj_class]] * img_cond.shape[0]
 
     # Optional RAFT flow guidance for temporal attention
-    joint_attention_kwargs = None
+    joint_attention_kwargs = {}
     if args.flow_guidance:
         try:
             flow_info = compute_flow_guidance(
@@ -306,12 +316,15 @@ def run():
                 resize_to=args.flow_resize,
             )
             if flow_info is not None and flow_info.get("donors_temp", None) is not None:
-                joint_attention_kwargs = {
-                    "flow_fields": flow_info.get("flow_fields"),
-                }
+                joint_attention_kwargs["flow_fields"] = flow_info.get("flow_fields")
                 print("Flow guidance enabled with per-token flow fields.")
         except Exception as e:
             print(f"[warn] Flow guidance disabled due to error: {e}")
+
+    # Reference routing info (all indices after targets are references)
+    num_refs = img_cond.shape[0] - num_frames
+    joint_attention_kwargs["ref_count"] = num_refs
+    joint_attention_kwargs["anchor_weight"] = max(1.0, float(args.anchor_weight))
 
     # Run the FluxFill pipeline once for the whole batch
     with torch.no_grad():

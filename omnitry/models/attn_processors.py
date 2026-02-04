@@ -116,11 +116,17 @@ class FluxAttnProcessor2_0:
             raise ImportError("FluxAttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0.")
         self._flow_fields = None
         self._flow_donors = None
+        self._ref_count = 1
+        self._anchor_weight = 1.0
 
     def set_flow(self, flow_fields=None, flow_donors=None):
         # store flow guidance on the processor; avoids passing via kwargs that trigger warnings upstream
         self._flow_fields = flow_fields
         self._flow_donors = flow_donors
+
+    def set_refs(self, ref_count: int = 1, anchor_weight: float = 1.0):
+        self._ref_count = max(1, int(ref_count))
+        self._anchor_weight = max(1.0, float(anchor_weight))
 
     def _run_attn_group(self, query_g, key_g, value_g, q_lens_g, k_lens_g, attn, head_dim):
         """
@@ -290,8 +296,10 @@ class FluxAttnProcessor2_0:
         assert txt_len <= Lq_total, f"txt_len {txt_len} > seq_len {Lq_total}"
         
         B = key.shape[0]
-        ref_idx = B - 1
-        T = B - 1
+        ref_count = self._ref_count if self._ref_count is not None else 1
+        T = B - ref_count
+        ref_indices = list(range(T, B))
+        anchor_idx = ref_indices[-1]
 
         # Head split indices
         H_total = attn.heads
@@ -308,19 +316,31 @@ class FluxAttnProcessor2_0:
         v_fid_full  = value[:, H_temp:]
 
         
-        # donors for fidelity heads: ref only
+        # donors for fidelity heads: all refs (ref + anchor)
         donors_fid = [[] for _ in range(B)]
         for i in range(T):
-            donors_fid[i] = [ref_idx]
-        donors_fid[ref_idx] = []
+            donors = []
+            for r in ref_indices:
+                donors.append(r)
+                if r == anchor_idx and self._anchor_weight > 1.0:
+                    extra = int(math.floor(self._anchor_weight - 1.0))
+                    donors.extend([anchor_idx] * extra)
+            donors_fid[i] = donors
+        for r in ref_indices:
+            donors_fid[r] = []
         
         # donors for temporal heads: ref + neighbors (override-able by flow)
         flow_fields = self._flow_fields  # optional: (T-1, 2, Hf, Wf)
         donors_temp = [[] for _ in range(B)]
         for i in range(T):
             neighbors = [j for j in range(T) if abs(j - i) <= 5]  # temporal window include self and neighbors
-            donors_temp[i] = neighbors + [ref_idx]
-        donors_temp[ref_idx] = []
+            donors = neighbors + ref_indices
+            if self._anchor_weight > 1.0:
+                extra = int(math.floor(self._anchor_weight - 1.0))
+                donors += [anchor_idx] * extra
+            donors_temp[i] = donors
+        for r in ref_indices:
+            donors_temp[r] = []
         
 
         # Build K/V separately per head group (this is where routing differs)
@@ -371,8 +391,8 @@ class FluxAttnProcessor2_0:
 
                 for i in range(B):
                     # donors may vary per frame; collect raw then pad
-                    if i == ref_idx:
-                        donor_frames = [ref_idx]
+                    if i in ref_indices:
+                        donor_frames = [i]
                         donor_idx_list = [flat_coords[0] * W_tok + flat_coords[1]]
                     else:
                         donor_frames = []
@@ -394,9 +414,15 @@ class FluxAttnProcessor2_0:
                             next_x = torch.clamp((grid_x + flow_next[0]).round().long(), 0, H_tok - 1)
                             donor_frames.append(i + 1)
                             donor_idx_list.append((next_y * W_tok + next_x).reshape(-1))
-                        # reference (same coords)
-                        donor_frames.append(ref_idx)
-                        donor_idx_list.append((grid_y * W_tok + grid_x).reshape(-1))
+                        # references (same coords), with optional anchor bias
+                        for r in ref_indices:
+                            donor_frames.append(r)
+                            donor_idx_list.append((grid_y * W_tok + grid_x).reshape(-1))
+                            if r == anchor_idx and self._anchor_weight > 1.0:
+                                extra = int(math.floor(self._anchor_weight - 1.0))
+                                for _ in range(extra):
+                                    donor_frames.append(anchor_idx)
+                                    donor_idx_list.append((grid_y * W_tok + grid_x).reshape(-1))
 
                     # gather and concat along sequence
                     gathered_k = []

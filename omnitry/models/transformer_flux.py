@@ -489,9 +489,13 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
         # pull flow guidance off the kwargs and stash it on processors to avoid warnings
         flow_fields = None
         flow_donors = None
+        ref_count = None
+        anchor_weight = 1.0
         if joint_attention_kwargs is not None:
             flow_fields = joint_attention_kwargs.pop("flow_fields", None)
             flow_donors = joint_attention_kwargs.pop("flow_donors", None)
+            ref_count = joint_attention_kwargs.pop("ref_count", None)
+            anchor_weight = joint_attention_kwargs.pop("anchor_weight", 1.0)
 
         if USE_PEFT_BACKEND:
             # weight the lora layers by setting `lora_scale` for each PEFT layer
@@ -510,6 +514,14 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
             for blk in self.single_transformer_blocks:
                 if hasattr(blk.attn, "processor") and hasattr(blk.attn.processor, "set_flow"):
                     blk.attn.processor.set_flow(flow_fields, flow_donors)
+
+        if ref_count is not None or anchor_weight is not None:
+            for blk in self.transformer_blocks:
+                if hasattr(blk.attn, "processor") and hasattr(blk.attn.processor, "set_refs"):
+                    blk.attn.processor.set_refs(ref_count or 1, anchor_weight or 1.0)
+            for blk in self.single_transformer_blocks:
+                if hasattr(blk.attn, "processor") and hasattr(blk.attn.processor, "set_refs"):
+                    blk.attn.processor.set_refs(ref_count or 1, anchor_weight or 1.0)
 
         # patchify
         hidden_states = self.x_embedder(hidden_states)
