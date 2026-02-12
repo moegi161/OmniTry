@@ -522,6 +522,10 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
             for blk in self.single_transformer_blocks:
                 if hasattr(blk.attn, "processor") and hasattr(blk.attn.processor, "set_refs"):
                     blk.attn.processor.set_refs(ref_count or 1, anchor_weight or 1.0)
+            
+            # Store ref_count on transformer module so LoRA Linear layers can access it
+            self._current_ref_count = ref_count or 1
+            self._current_anchor_weight = anchor_weight or 1.0
 
         # patchify
         hidden_states = self.x_embedder(hidden_states)
@@ -560,23 +564,29 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
             # img_ids[b, :, 2] += b * max_w # original omnitry version
         """
         # Assume:
-        # - bsz = n_targets + 1
-        # - ordering: [tar1, tar2, ..., tar_n, ref]
-        # - last index (bsz - 1) is the reference
+        # - bsz = n_targets + ref_count
+        # - ordering: [tar1, tar2, ..., tar_n, ref, anchor, ...]
+        # - last ref_count indices are references/anchors
+        
+        # Use ref_count if available, otherwise assume 1 reference
+        if ref_count is None:
+            ref_count = 1
+        
+        n_targets = bsz - ref_count
+        ref_idx = n_targets - 1  # first target (for width ID shift computation)
 
-        ref_idx = bsz - 1
-
-        # Compute max_w from the reference BEFORE any shift.
+        # Compute max_w from the first target (last target index)
         # (If you compute from all items after shifting, you can accidentally double-count.)
-        ref_max_w = img_ids[ref_idx, :, 2].max().item() + 1  # +1 for correct indexing
+        ref_max_w = img_ids[n_targets - 1, :, 2].max().item() + 1  # +1 for correct indexing
 
         #for b in range(bsz):
         #    # set "t-id"/batch-id slot
         #    img_ids[b, :, 0] = b
         #    txt_ids[b, :, 0] = b
 
-        # shift only the reference width coordinate
-        img_ids[ref_idx, :, 2] += ref_max_w
+        # shift all reference/anchor width coordinates (indices n_targets to bsz-1)
+        for ref_b in range(n_targets, bsz):
+            img_ids[ref_b, :, 2] += ref_max_w
         
         
         # prepare rope embedding

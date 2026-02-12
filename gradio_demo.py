@@ -175,11 +175,14 @@ def create_hacked_forward(module):
     return hacked_lora_forward.__get__(module, type(module))
     
     """
-    # Ianna: (target, target, ..., target, reference) layout
+    # Ianna: (target, target, ..., target, reference[, anchor]) layout
     def hacked_lora_forward(self, x, *args, **kwargs):
         #Expected batch layout:
-        #  x[0..B-2] = targets (frames)
-        #  x[B-1]    = reference
+        #  x[0..n_targets-1] = targets (frames)
+        #  x[n_targets..]    = references/anchors
+        #
+        # Get ref_count: first try to get it from parent transformer module,
+        # otherwise assume 1 reference per target batch
 
         b = x.shape[0]
         if b == 0:
@@ -189,9 +192,29 @@ def create_hacked_forward(module):
         if b == 1:
             return lora_forward(self, "vtryon_lora", x, *args, **kwargs)
 
-        n_targets = b - 1
+        # Try to get ref_count from the parent transformer module
+        # Walk up module hierarchy to find the transformer
+        ref_count = 1  # default fallback
+        try:
+            # Get the root module (transformer)
+            module = self
+            while hasattr(module, "parent"):
+                module = module.parent
+            # Try to find _current_ref_count attribute
+            if hasattr(module, "_current_ref_count"):
+                ref_count = module._current_ref_count
+        except:
+            # If traversal fails, use default
+            ref_count = 1
+        
+        n_targets = b - ref_count
+        
+        if n_targets < 1:
+            # Safety: at least 1 target
+            n_targets = max(1, b - 1)
+        
         x_target = x[:n_targets]
-        x_ref    = x[n_targets:]      # last element
+        x_ref    = x[n_targets:]      # remaining elements (references + anchors)
 
         y_target = lora_forward(self, "vtryon_lora", x_target, *args, **kwargs)
         y_ref    = lora_forward(self, "garment_lora", x_ref,    *args, **kwargs)
@@ -255,6 +278,8 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
     img_cond = torch.stack([person_image, object_image_padded]).to(dtype=weight_dtype, device=device) 
     mask = torch.zeros_like(img_cond).to(img_cond)
 
+    joint_attention_kwargs = {"ref_count": 1}
+    
     with torch.no_grad():
         img = pipeline(
             prompt=prompts,
@@ -265,6 +290,7 @@ def generate(person_image, object_image, object_class, steps=20, guidance_scale=
             guidance_scale=guidance_scale,
             num_inference_steps=steps,
             generator=torch.Generator(device).manual_seed(seed),
+            joint_attention_kwargs=joint_attention_kwargs,
         ).images[0]
 
     return img

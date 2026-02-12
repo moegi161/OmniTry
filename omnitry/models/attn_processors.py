@@ -303,7 +303,7 @@ class FluxAttnProcessor2_0:
 
         # Head split indices
         H_total = attn.heads
-        H_temp = max(1, H_total // 2)
+        H_temp = max(1, H_total // 4)
         H_fid = H_total - H_temp
 
         # Split heads on full sequence first
